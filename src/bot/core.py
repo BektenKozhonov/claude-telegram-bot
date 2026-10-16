@@ -56,6 +56,10 @@ class ClaudeCodeBot:
         builder.write_timeout(30)
         builder.pool_timeout(30)
 
+        # Handle updates concurrently so button presses (permission replies)
+        # and /abort are processed while Claude is still working.
+        builder.concurrent_updates(True)
+
         self.app = builder.build()
 
         # Initialize feature registry

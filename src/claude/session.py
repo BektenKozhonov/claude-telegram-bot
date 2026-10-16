@@ -164,6 +164,24 @@ class SessionManager:
         self.storage = storage
         self.active_sessions: Dict[str, ClaudeSession] = {}
 
+    async def adopt_session(
+        self, user_id: int, project_path: Path, session_id: str
+    ) -> ClaudeSession:
+        """Register a Claude Code session created elsewhere (e.g. local CLI)."""
+        now = datetime.now(UTC)
+        session = ClaudeSession(
+            session_id=session_id,
+            user_id=user_id,
+            project_path=project_path,
+            created_at=now,
+            last_used=now,
+            is_new_session=False,
+        )
+        self.active_sessions[session_id] = session
+        await self.storage.save_session(session)
+        logger.info("Adopted external session", session_id=session_id)
+        return session
+
     async def get_or_create_session(
         self,
         user_id: int,

@@ -10,6 +10,7 @@ Features:
 
 import shutil
 import tarfile
+import tempfile
 import uuid
 import zipfile
 from collections import defaultdict
@@ -50,8 +51,8 @@ class FileHandler:
     def __init__(self, config: Settings, security: SecurityValidator):
         self.config = config
         self.security = security
-        self.temp_dir = Path("/tmp/claude_bot_files")
-        self.temp_dir.mkdir(exist_ok=True)
+        self.temp_dir = Path(tempfile.gettempdir()) / "claude_bot_files"
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
 
         # Supported code extensions
         self.code_extensions = {

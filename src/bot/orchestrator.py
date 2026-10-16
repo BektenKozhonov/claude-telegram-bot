@@ -8,11 +8,19 @@ classic mode, delegates to existing full-featured handlers.
 import asyncio
 import re
 import time
+import uuid
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import structlog
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -22,6 +30,7 @@ from telegram.ext import (
     filters,
 )
 
+from ..claude import runtime
 from ..claude.exceptions import ClaudeToolValidationError
 from ..claude.sdk_integration import StreamUpdate
 from ..config.settings import Settings
@@ -101,9 +110,22 @@ def _tool_icon(name: str) -> str:
 class MessageOrchestrator:
     """Routes messages based on mode. Single entry point for all Telegram updates."""
 
+    # Bottom-keyboard buttons: "<emoji> <mode label>" and "🧠 <model>"
+    # Telegram clients may append U+FE0F to emoji, so tolerate it and spaces
+    _MODE_BUTTON_RE = (
+        r"^\s*(?:\U0001f6e0|\U0001f4cb|✏)️?\s*(?:Обычный|План|Авто-правки)\s*$"
+    )
+    _MODEL_BUTTON_RE = r"^\s*\U0001f9e0️?\s*.+$"
+    _QUEUE_LIMIT = 5
+    _PERMISSION_TIMEOUT = 600
+
     def __init__(self, settings: Settings, deps: Dict[str, Any]):
         self.settings = settings
         self.deps = deps
+        self._user_locks: Dict[int, asyncio.Lock] = {}
+        self._queues: Dict[int, List[Tuple[Update, Any]]] = {}
+        # request id -> (user_id, future resolved with once/always/reject)
+        self._pending_perms: Dict[str, Tuple[int, "asyncio.Future[str]"]] = {}
 
     def _inject_deps(self, handler: Callable) -> Callable:  # type: ignore[type-arg]
         """Wrap handler to inject dependencies into context.bot_data."""
@@ -291,6 +313,10 @@ class MessageOrchestrator:
             ("status", self.agentic_status),
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
+            ("sessions", self.agentic_sessions),
+            ("model", self.agentic_model),
+            ("abort", self.agentic_abort),
+            ("settings", self.agentic_settings),
         ]
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
@@ -298,10 +324,27 @@ class MessageOrchestrator:
         for cmd, handler in handlers:
             app.add_handler(CommandHandler(cmd, self._inject_deps(handler)))
 
+        # Bottom-keyboard buttons (mode / model) open menus, never reach Claude
+        button_re = f"(?:{self._MODE_BUTTON_RE})|(?:{self._MODEL_BUTTON_RE})"
+        app.add_handler(
+            MessageHandler(
+                filters.Regex(self._MODE_BUTTON_RE),
+                self._inject_deps(self.agentic_mode_button),
+            ),
+            group=5,
+        )
+        app.add_handler(
+            MessageHandler(
+                filters.Regex(self._MODEL_BUTTON_RE),
+                self._inject_deps(self.agentic_model_button),
+            ),
+            group=5,
+        )
+
         # Text messages -> Claude
         app.add_handler(
             MessageHandler(
-                filters.TEXT & ~filters.COMMAND,
+                filters.TEXT & ~filters.COMMAND & ~filters.Regex(button_re),
                 self._inject_deps(self.agentic_text),
             ),
             group=10,
@@ -326,6 +369,12 @@ class MessageOrchestrator:
             CallbackQueryHandler(
                 self._inject_deps(self._agentic_callback),
                 pattern=r"^cd:",
+            )
+        )
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._agentic_pick_callback),
+                pattern=r"^(sess|model|mode|perm|settings):",
             )
         )
 
@@ -388,6 +437,10 @@ class MessageOrchestrator:
                 BotCommand("status", "Show session status"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "List repos / switch workspace"),
+                BotCommand("sessions", "Continue a previous session"),
+                BotCommand("model", "Choose Claude model"),
+                BotCommand("abort", "Stop the current request"),
+                BotCommand("settings", "Output and queue settings"),
             ]
             if self.settings.enable_project_threads:
                 commands.append(BotCommand("sync_threads", "Sync project topics"))
@@ -466,6 +519,7 @@ class MessageOrchestrator:
             f"Commands: /new (reset) · /status"
             f"{sync_line}",
             parse_mode="HTML",
+            reply_markup=self._main_keyboard(),
         )
 
     async def agentic_new(
@@ -687,7 +741,274 @@ class MessageOrchestrator:
 
         return _on_stream
 
+    # --- Permission requests, queue, abort, settings ---
+
+    @staticmethod
+    def _describe_tool_call(tool_name: str, tool_input: Dict[str, Any]) -> str:
+        """HTML description of what Claude wants to do."""
+        icon = _tool_icon(tool_name)
+        if tool_name == "ExitPlanMode":
+            plan = str(tool_input.get("plan", "")).strip()
+            return "\U0001f4cb <b>План готов</b>\n\n" + escape_html(plan[:3000])
+        if tool_name == "Bash":
+            cmd = _redact_secrets(str(tool_input.get("command", "")))[:600]
+            return f"{icon} <b>Команда</b>\n<pre>{escape_html(cmd)}</pre>"
+        if tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+            path = tool_input.get("file_path") or tool_input.get("notebook_path", "")
+            return f"{icon} <b>{tool_name}</b>\n<code>{escape_html(str(path))}</code>"
+        detail = MessageOrchestrator._summarize_tool_input(tool_name, tool_input)
+        return f"{icon} <b>{escape_html(tool_name)}</b>\n{escape_html(detail)}"
+
+    async def _request_permission(
+        self,
+        bot: Any,
+        chat_id: int,
+        user_id: int,
+        tool_name: str,
+        tool_input: Dict[str, Any],
+    ) -> str:
+        """Ask the user in Telegram; returns "once", "always" or "reject"."""
+        request_id = uuid.uuid4().hex[:8]
+        future: "asyncio.Future[str]" = asyncio.get_running_loop().create_future()
+        self._pending_perms[request_id] = (user_id, future)
+
+        if tool_name == "ExitPlanMode":
+            buttons = [
+                InlineKeyboardButton(
+                    "✅ Выполнить", callback_data=f"perm:once:{request_id}"
+                ),
+                InlineKeyboardButton(
+                    "❌ Отклонить", callback_data=f"perm:reject:{request_id}"
+                ),
+            ]
+        else:
+            buttons = [
+                InlineKeyboardButton(
+                    "✅ Один раз", callback_data=f"perm:once:{request_id}"
+                ),
+                InlineKeyboardButton(
+                    "\U0001f513 Всегда", callback_data=f"perm:always:{request_id}"
+                ),
+                InlineKeyboardButton(
+                    "❌ Отклонить", callback_data=f"perm:reject:{request_id}"
+                ),
+            ]
+        text = "\U0001f510 <b>Разрешение</b>\n\n" + self._describe_tool_call(
+            tool_name, tool_input
+        )
+        message = await bot.send_message(
+            chat_id,
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([buttons]),
+        )
+        try:
+            return await asyncio.wait_for(future, timeout=self._PERMISSION_TIMEOUT)
+        except asyncio.TimeoutError:
+            try:
+                await message.edit_text(
+                    text + "\n\n⌛ Время вышло, отклонено.", parse_mode="HTML"
+                )
+            except Exception:
+                pass
+            return "reject"
+        finally:
+            self._pending_perms.pop(request_id, None)
+
+    async def _handle_permission_callback(self, query: Any, value: str) -> None:
+        decision, _, request_id = value.partition(":")
+        pending = self._pending_perms.get(request_id)
+        if (
+            decision not in ("once", "always", "reject")
+            or pending is None
+            or pending[0] != query.from_user.id
+            or pending[1].done()
+        ):
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+        pending[1].set_result(decision)
+        verdict = {
+            "once": "✅ Разрешено один раз",
+            "always": "\U0001f513 Разрешено всегда",
+            "reject": "❌ Отклонено",
+        }[decision]
+        try:
+            await query.edit_message_text(
+                (query.message.text_html or "") + f"\n\n<b>{verdict}</b>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    async def agentic_abort(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Stop the running request, drop the queue and pending permissions."""
+        user_id = update.effective_user.id
+        dropped = len(self._queues.pop(user_id, []))
+        for uid, future in list(self._pending_perms.values()):
+            if uid == user_id and not future.done():
+                future.set_result("reject")
+
+        client = runtime.active_clients.get(user_id)
+        if client is None and not dropped:
+            await update.message.reply_text("Нечего останавливать.")
+            return
+        if client is not None:
+            try:
+                await client.interrupt()
+            except Exception as e:
+                logger.warning("Interrupt failed", error=str(e), user_id=user_id)
+        suffix = f" Очередь очищена: {dropped}." if dropped else ""
+        await update.message.reply_text(f"⏹ Остановлено.{suffix}")
+
+    def _settings_menu(self) -> Tuple[str, InlineKeyboardMarkup]:
+        s = runtime.settings()
+
+        def mark(key: str) -> str:
+            return "✅" if s.get(key) else "▫️"
+
+        always = s.always_allowed()
+        rows = [
+            [
+                InlineKeyboardButton(
+                    f"{mark('compact_output')} Компактный вывод",
+                    callback_data="settings:compact_output",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"{mark('footer')} Подпись под ответом",
+                    callback_data="settings:footer",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"{mark('queue')} Очередь сообщений",
+                    callback_data="settings:queue",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"\U0001f5d1 Сбросить «Всегда» ({len(always)})",
+                    callback_data="settings:reset_always",
+                )
+            ],
+        ]
+        text = "<b>Настройки</b>"
+        if always:
+            text += "\nВсегда разрешено: " + ", ".join(
+                f"<code>{escape_html(t)}</code>" for t in always
+            )
+        return text, InlineKeyboardMarkup(rows)
+
+    async def agentic_settings(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        text, markup = self._settings_menu()
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
+
+    async def _handle_settings_callback(self, query: Any, value: str) -> None:
+        s = runtime.settings()
+        if value == "reset_always":
+            s.set("always_allowed_tools", [])
+        elif value in ("compact_output", "footer", "queue"):
+            s.toggle(value)
+        text, markup = self._settings_menu()
+        try:
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        except Exception:
+            pass  # message not modified
+
     async def agentic_text(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Entry point for text: run now, or wait in the per-user queue."""
+        user_id = update.effective_user.id
+        lock = self._user_locks.setdefault(user_id, asyncio.Lock())
+
+        if lock.locked():
+            if not runtime.settings().get("queue"):
+                await update.message.reply_text(
+                    "Claude ещё работает. Дождитесь ответа или /abort."
+                )
+                return
+            queue = self._queues.setdefault(user_id, [])
+            if len(queue) >= self._QUEUE_LIMIT:
+                await update.message.reply_text(
+                    f"Очередь заполнена ({self._QUEUE_LIMIT}). Дождитесь или /abort."
+                )
+                return
+            queue.append((update, context))
+            await update.message.reply_text(f"⏳ В очереди: {len(queue)}")
+            return
+
+        async with lock:
+            item: Optional[Tuple[Update, Any]] = (update, context)
+            while item is not None:
+                await self._agentic_text_with_approvals(*item)
+                queue = self._queues.get(user_id)
+                item = queue.pop(0) if queue else None
+
+    async def _agentic_text_with_approvals(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Run one request with a Telegram approver registered for the user."""
+        user_id = update.effective_user.id
+        bot = context.bot
+        chat_id = update.effective_chat.id
+
+        async def requester(tool_name: str, tool_input: Dict[str, Any]) -> str:
+            return await self._request_permission(
+                bot, chat_id, user_id, tool_name, tool_input
+            )
+
+        runtime.permission_requesters[user_id] = requester
+        try:
+            await self._agentic_text_run(update, context)
+        finally:
+            runtime.permission_requesters.pop(user_id, None)
+
+    def _make_compact_callback(
+        self,
+        progress_msg: Any,
+        tool_log: List[Dict[str, Any]],
+        start_time: float,
+    ) -> Callable[[StreamUpdate], Any]:
+        """One progress message: Thinking -> current tool -> Writing answer."""
+        last_edit_time = [0.0]
+
+        async def _on_stream(update_obj: StreamUpdate) -> None:
+            status = None
+            if update_obj.tool_calls:
+                for tc in update_obj.tool_calls:
+                    name = tc.get("name", "unknown")
+                    detail = self._summarize_tool_input(name, tc.get("input", {}))
+                    tool_log.append({"kind": "tool", "name": name, "detail": detail})
+                    status = f"{_tool_icon(name)} {name}"
+                    if detail:
+                        status += f": {detail[:128]}"
+            elif update_obj.type == "assistant" and update_obj.content:
+                status = "✍️ Пишу ответ…"
+
+            now = time.time()
+            if status and (now - last_edit_time[0]) >= 2.0:
+                last_edit_time[0] = now
+                tools = sum(1 for e in tool_log if e.get("kind") == "tool")
+                try:
+                    await progress_msg.edit_text(
+                        f"⏳ Работаю · вызовов: {tools} · "
+                        f"{now - start_time:.0f} с\n{status}"
+                    )
+                except Exception:
+                    pass
+
+        return _on_stream
+
+    async def _agentic_text_run(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Direct Claude passthrough. Simple progress. No suggestions."""
@@ -712,7 +1033,10 @@ class MessageOrchestrator:
         await chat.send_action("typing")
 
         verbose_level = self._get_verbose_level(context)
-        progress_msg = await update.message.reply_text("Working...")
+        compact = bool(runtime.settings().get("compact_output")) and verbose_level > 0
+        progress_msg = await update.message.reply_text(
+            "\U0001f4ad Думаю…" if compact else "Working..."
+        )
 
         claude_integration = context.bot_data.get("claude_integration")
         if not claude_integration:
@@ -733,9 +1057,12 @@ class MessageOrchestrator:
         # --- Verbose progress tracking via stream callback ---
         tool_log: List[Dict[str, Any]] = []
         start_time = time.time()
-        on_stream = self._make_stream_callback(
-            verbose_level, progress_msg, tool_log, start_time
-        )
+        if compact:
+            on_stream = self._make_compact_callback(progress_msg, tool_log, start_time)
+        else:
+            on_stream = self._make_stream_callback(
+                verbose_level, progress_msg, tool_log, start_time
+            )
 
         # Independent typing heartbeat — stays alive even with no stream events
         heartbeat = self._start_typing_heartbeat(chat)
@@ -805,7 +1132,18 @@ class MessageOrchestrator:
         finally:
             heartbeat.cancel()
 
-        await progress_msg.delete()
+        if compact:
+            tool_count = sum(1 for e in tool_log if e.get("kind") == "tool")
+            elapsed = time.time() - start_time
+            icon = "✅" if success else "⚠️"
+            try:
+                await progress_msg.edit_text(
+                    f"{icon} Готово · вызовов: {tool_count} · {elapsed:.0f} с"
+                )
+            except Exception:
+                pass
+        else:
+            await progress_msg.delete()
 
         for i, message in enumerate(formatted_messages):
             if not message.text or not message.text.strip():
@@ -842,6 +1180,19 @@ class MessageOrchestrator:
                             update.message.message_id if i == 0 else None
                         ),
                     )
+
+        if runtime.settings().get("footer"):
+            emoji, label = runtime.MODES.get(
+                runtime.settings().get("mode"), runtime.MODES["default"]
+            )
+            try:
+                await update.message.reply_text(
+                    f"<i>{emoji} {label} · \U0001f9e0 {escape_html(self._model_label())}"
+                    f" · ⏱ {time.time() - start_time:.0f} с</i>",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
 
         # Audit log
         audit_logger = context.bot_data.get("audit_logger")
@@ -1176,6 +1527,240 @@ class MessageOrchestrator:
             "<b>Repos</b>\n\n" + "\n".join(lines),
             parse_mode="HTML",
             reply_markup=reply_markup,
+        )
+
+    # Models offered by /model: (button label, value passed to Claude Code)
+    _MODEL_CHOICES = [
+        ("Default", ""),
+        ("Fable 5.1", "claude-fable-5-1"),
+        ("Opus 5.5", "claude-opus-5-5"),
+        ("Sonnet 5.5", "claude-sonnet-5-5"),
+        ("Haiku 5.5", "claude-haiku-5-5"),
+    ]
+
+    def _read_model(self) -> str:
+        return str(runtime.settings().get("model") or "")
+
+    def _model_label(self) -> str:
+        current = self._read_model()
+        for label, value in self._MODEL_CHOICES:
+            if value == current:
+                return label
+        return current or "Default"
+
+    def _main_keyboard(self) -> ReplyKeyboardMarkup:
+        """Persistent bottom keyboard: current mode and model."""
+        emoji, label = runtime.MODES.get(
+            runtime.settings().get("mode"), runtime.MODES["default"]
+        )
+        return ReplyKeyboardMarkup(
+            [
+                [
+                    KeyboardButton(f"{emoji} {label}"),
+                    KeyboardButton(f"\U0001f9e0 {self._model_label()}"[:40]),
+                ]
+            ],
+            resize_keyboard=True,
+            is_persistent=True,
+        )
+
+    async def _send_model_menu(self, update: Update) -> None:
+        current = self._read_model()
+        rows = []
+        for label, value in self._MODEL_CHOICES:
+            mark = "✅ " if value == current else ""
+            rows.append(
+                [InlineKeyboardButton(f"{mark}{label}", callback_data=f"model:{value}")]
+            )
+        await update.message.reply_text(
+            f"Model: <code>{escape_html(current or 'default')}</code>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    async def agentic_model(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Show or change the Claude model: /model [name]."""
+        args = update.message.text.split()[1:] if update.message.text else []
+        if args:
+            value = args[0] if args[0].lower() != "default" else ""
+            runtime.settings().set("model", value)
+            await update.message.reply_text(
+                f"Model: <code>{escape_html(value or 'default')}</code>",
+                parse_mode="HTML",
+                reply_markup=self._main_keyboard(),
+            )
+            return
+        await self._send_model_menu(update)
+
+    async def agentic_model_button(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Bottom-keyboard model button: open the model menu."""
+        await self._send_model_menu(update)
+
+    async def agentic_mode_button(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Bottom-keyboard mode button: open the mode menu."""
+        current = runtime.settings().get("mode")
+        descriptions = {
+            "default": "спрашивает перед правками и командами",
+            "plan": "только план, ничего не меняет",
+            "acceptEdits": "правки файлов без вопросов, команды спрашивает",
+        }
+        rows = []
+        for value, (emoji, label) in runtime.MODES.items():
+            mark = "✅ " if value == current else ""
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"{mark}{emoji} {label}", callback_data=f"mode:{value}"
+                    )
+                ]
+            )
+        text = "<b>Режим</b>\n" + "\n".join(
+            f"{e} {l} — {descriptions[v]}" for v, (e, l) in runtime.MODES.items()
+        )
+        await update.message.reply_text(
+            text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows)
+        )
+
+    @staticmethod
+    def _local_sessions(directory: Path, limit: int = 8) -> List[Dict[str, Any]]:
+        """Read Claude Code session files for a directory from ~/.claude/projects."""
+        import json
+        from datetime import datetime
+
+        folder = Path.home() / ".claude" / "projects"
+        folder = folder / re.sub(r"[^A-Za-z0-9]", "-", str(directory))
+        if not folder.is_dir():
+            return []
+
+        files = sorted(
+            folder.glob("*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True
+        )
+        result: List[Dict[str, Any]] = []
+        for f in files[:limit]:
+            title = ""
+            try:
+                with f.open(encoding="utf-8") as fh:
+                    for _, line in zip(range(80), fh):
+                        try:
+                            entry = json.loads(line)
+                        except ValueError:
+                            continue
+                        if entry.get("type") != "user" or entry.get("isMeta"):
+                            continue
+                        content = entry.get("message", {}).get("content")
+                        if isinstance(content, list):
+                            content = " ".join(
+                                p.get("text", "")
+                                for p in content
+                                if isinstance(p, dict)
+                            )
+                        if isinstance(content, str):
+                            content = content.strip()
+                            if content and not content.startswith("<"):
+                                title = " ".join(content.split())
+                                break
+            except OSError:
+                continue
+            result.append(
+                {
+                    "id": f.stem,
+                    "title": title or "(no title)",
+                    "time": datetime.fromtimestamp(f.stat().st_mtime),
+                }
+            )
+        return result
+
+    async def agentic_sessions(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """List Claude Code sessions of the current directory (incl. local CLI)."""
+        current_dir = Path(
+            context.user_data.get("current_directory", self.settings.approved_directory)
+        )
+        current_id = context.user_data.get("claude_session_id")
+        sessions = self._local_sessions(current_dir)
+        if not sessions:
+            await update.message.reply_text(
+                f"No sessions in <code>{escape_html(str(current_dir))}</code>.",
+                parse_mode="HTML",
+            )
+            return
+
+        rows = []
+        for s in sessions:
+            mark = "● " if s["id"] == current_id else ""
+            label = f"{mark}{s['time']:%d.%m %H:%M} · {s['title']}"[:60]
+            rows.append([InlineKeyboardButton(label, callback_data=f"sess:{s['id']}")])
+        await update.message.reply_text(
+            f"Sessions in <code>{escape_html(str(current_dir))}</code>\n"
+            "Pick one to continue it:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    async def _agentic_pick_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle sess: and model: button presses."""
+        query = update.callback_query
+        await query.answer()
+        kind, _, value = query.data.partition(":")
+
+        if kind == "perm":
+            await self._handle_permission_callback(query, value)
+            return
+
+        if kind == "settings":
+            await self._handle_settings_callback(query, value)
+            return
+
+        if kind in ("model", "mode"):
+            if kind == "model":
+                if value not in {v for _, v in self._MODEL_CHOICES}:
+                    return
+                runtime.settings().set("model", value)
+                confirmation = f"\U0001f9e0 {self._model_label()}"
+            else:
+                if value not in runtime.MODES:
+                    return
+                runtime.settings().set("mode", value)
+                emoji, label = runtime.MODES[value]
+                confirmation = f"{emoji} {label}"
+            # The bottom keyboard can only be replaced by sending a new message
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            await query.message.chat.send_message(
+                confirmation, reply_markup=self._main_keyboard()
+            )
+            return
+
+        # kind == "sess": only accept ids that exist for the current directory
+        current_dir = Path(
+            context.user_data.get("current_directory", self.settings.approved_directory)
+        )
+        known = {s["id"]: s for s in self._local_sessions(current_dir, limit=50)}
+        if value not in known:
+            await query.edit_message_text("Session not found.")
+            return
+
+        claude_integration = context.bot_data.get("claude_integration")
+        if claude_integration:
+            await claude_integration.session_manager.adopt_session(
+                query.from_user.id, current_dir, value
+            )
+        context.user_data["claude_session_id"] = value
+        context.user_data["force_new_session"] = False
+        await query.edit_message_text(
+            f"Continuing: {escape_html(known[value]['title'][:80])}",
+            parse_mode="HTML",
         )
 
     async def _agentic_callback(

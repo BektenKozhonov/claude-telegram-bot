@@ -23,6 +23,8 @@ from claude_agent_sdk import (
     CLIJSONDecodeError,
     CLINotFoundError,
     Message,
+    PermissionResultAllow,
+    PermissionResultDeny,
     ProcessError,
     ResultMessage,
     ToolUseBlock,
@@ -32,6 +34,7 @@ from claude_agent_sdk._errors import MessageParseError
 from claude_agent_sdk._internal.message_parser import parse_message
 
 from ..config.settings import Settings
+from . import runtime
 from .exceptions import (
     ClaudeMCPError,
     ClaudeParsingError,
@@ -156,6 +159,7 @@ class ClaudeSDKManager:
         session_id: Optional[str] = None,
         continue_session: bool = False,
         stream_callback: Optional[Callable[[StreamUpdate], None]] = None,
+        user_id: Optional[int] = None,
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK."""
         start_time = asyncio.get_event_loop().time()
@@ -187,6 +191,48 @@ class ClaudeSDKManager:
                 ),
             )
 
+            # Model and permission mode chosen in Telegram (data/settings.json)
+            user_settings = runtime.settings()
+            chosen_model = user_settings.get("model")
+            if chosen_model:
+                options.model = chosen_model
+
+            mode = user_settings.get("mode") or "default"
+            requester = runtime.permission_requesters.get(user_id) if user_id else None
+            timeout_seconds = self.config.claude_timeout_seconds
+            if requester is not None:
+                options.permission_mode = mode  # type: ignore[assignment]
+                if mode in ("default", "acceptEdits", "plan"):
+                    # Only read-only tools are pre-approved; the rest go through
+                    # can_use_tool so the user can confirm them in Telegram.
+                    always = set(user_settings.always_allowed())
+                    allowed = list(self.config.claude_allowed_tools or [])
+                    options.allowed_tools = [
+                        t for t in allowed if t in runtime.SAFE_TOOLS or t in always
+                    ]
+
+                    async def _can_use_tool(
+                        tool_name: str, tool_input: Dict[str, Any], _ctx: Any
+                    ) -> Any:
+                        if tool_name in runtime.settings().always_allowed():
+                            return PermissionResultAllow()
+                        ask = runtime.permission_requesters.get(user_id)  # type: ignore[arg-type]
+                        if ask is None:
+                            return PermissionResultDeny(message="No approver")
+                        decision = await ask(tool_name, tool_input)
+                        if decision == "always":
+                            runtime.settings().add_always_allowed(tool_name)
+                            return PermissionResultAllow()
+                        if decision == "once":
+                            return PermissionResultAllow()
+                        return PermissionResultDeny(
+                            message="Rejected by the user in Telegram"
+                        )
+
+                    options.can_use_tool = _can_use_tool
+                # Time spent waiting for the human must not hit the timeout
+                timeout_seconds = max(timeout_seconds, 3600)
+
             # Pass MCP server configuration if enabled
             if self.config.enable_mcp and self.config.mcp_config_path:
                 options.mcp_servers = self._load_mcp_config(self.config.mcp_config_path)
@@ -208,47 +254,54 @@ class ClaudeSDKManager:
 
             async def _run_client() -> None:
                 async with ClaudeSDKClient(options) as client:
-                    await client.query(prompt)
+                    if user_id:
+                        runtime.active_clients[user_id] = client
+                    try:
+                        await _consume(client)
+                    finally:
+                        if user_id and runtime.active_clients.get(user_id) is client:
+                            del runtime.active_clients[user_id]
 
-                    # Iterate over raw messages and parse them ourselves
-                    # so that MessageParseError (e.g. from rate_limit_event)
-                    # doesn't kill the underlying async generator. When
-                    # parse_message raises inside the SDK's receive_messages()
-                    # generator, Python terminates that generator permanently,
-                    # causing us to lose all subsequent messages including
-                    # the ResultMessage.
-                    async for raw_data in client._query.receive_messages():
+            async def _consume(client: ClaudeSDKClient) -> None:
+                await client.query(prompt)
+
+                # Iterate over raw messages and parse them ourselves
+                # so that MessageParseError (e.g. from rate_limit_event)
+                # doesn't kill the underlying async generator. When
+                # parse_message raises inside the SDK's receive_messages()
+                # generator, Python terminates that generator permanently,
+                # causing us to lose all subsequent messages including
+                # the ResultMessage.
+                async for raw_data in client._query.receive_messages():
+                    try:
+                        message = parse_message(raw_data)
+                    except MessageParseError as e:
+                        logger.debug(
+                            "Skipping unparseable message",
+                            error=str(e),
+                        )
+                        continue
+
+                    messages.append(message)
+
+                    if isinstance(message, ResultMessage):
+                        break
+
+                    # Handle streaming callback
+                    if stream_callback:
                         try:
-                            message = parse_message(raw_data)
-                        except MessageParseError as e:
-                            logger.debug(
-                                "Skipping unparseable message",
-                                error=str(e),
+                            await self._handle_stream_message(message, stream_callback)
+                        except Exception as callback_error:
+                            logger.warning(
+                                "Stream callback failed",
+                                error=str(callback_error),
+                                error_type=type(callback_error).__name__,
                             )
-                            continue
-
-                        messages.append(message)
-
-                        if isinstance(message, ResultMessage):
-                            break
-
-                        # Handle streaming callback
-                        if stream_callback:
-                            try:
-                                await self._handle_stream_message(
-                                    message, stream_callback
-                                )
-                            except Exception as callback_error:
-                                logger.warning(
-                                    "Stream callback failed",
-                                    error=str(callback_error),
-                                    error_type=type(callback_error).__name__,
-                                )
 
             # Execute with timeout
             await asyncio.wait_for(
                 _run_client(),
-                timeout=self.config.claude_timeout_seconds,
+                timeout=timeout_seconds,
             )
 
             # Extract cost, tools, and session_id from result message

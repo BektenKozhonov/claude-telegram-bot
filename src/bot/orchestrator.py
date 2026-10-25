@@ -35,6 +35,7 @@ from ..claude.exceptions import ClaudeToolValidationError
 from ..claude.sdk_integration import StreamUpdate
 from ..config.settings import Settings
 from ..projects import PrivateTopicsUnavailableError
+from .live_feed import LiveFeed, LiveFormatter
 from .utils.html_format import escape_html
 
 logger = structlog.get_logger()
@@ -116,6 +117,7 @@ class MessageOrchestrator:
         r"^\s*(?:\U0001f6e0|\U0001f4cb|✏)️?\s*(?:Обычный|План|Авто-правки)\s*$"
     )
     _MODEL_BUTTON_RE = r"^\s*\U0001f9e0️?\s*.+$"
+    _DIR_BUTTON_RE = r"^\s*\U0001f4c1️?\s*Папка\s*$"
     _QUEUE_LIMIT = 5
     _PERMISSION_TIMEOUT = 600
 
@@ -315,6 +317,7 @@ class MessageOrchestrator:
             ("repo", self.agentic_repo),
             ("sessions", self.agentic_sessions),
             ("model", self.agentic_model),
+            ("cd", self.agentic_repo),
             ("abort", self.agentic_abort),
             ("settings", self.agentic_settings),
         ]
@@ -325,7 +328,17 @@ class MessageOrchestrator:
             app.add_handler(CommandHandler(cmd, self._inject_deps(handler)))
 
         # Bottom-keyboard buttons (mode / model) open menus, never reach Claude
-        button_re = f"(?:{self._MODE_BUTTON_RE})|(?:{self._MODEL_BUTTON_RE})"
+        button_re = (
+            f"(?:{self._MODE_BUTTON_RE})|(?:{self._MODEL_BUTTON_RE})"
+            f"|(?:{self._DIR_BUTTON_RE})"
+        )
+        app.add_handler(
+            MessageHandler(
+                filters.Regex(self._DIR_BUTTON_RE),
+                self._inject_deps(self.agentic_dir_button),
+            ),
+            group=5,
+        )
         app.add_handler(
             MessageHandler(
                 filters.Regex(self._MODE_BUTTON_RE),
@@ -374,7 +387,7 @@ class MessageOrchestrator:
         app.add_handler(
             CallbackQueryHandler(
                 self._inject_deps(self._agentic_pick_callback),
-                pattern=r"^(sess|model|mode|perm|settings):",
+                pattern=r"^(sess|model|mode|perm|settings|br):",
             )
         )
 
@@ -436,7 +449,7 @@ class MessageOrchestrator:
                 BotCommand("new", "Start a fresh session"),
                 BotCommand("status", "Show session status"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
-                BotCommand("repo", "List repos / switch workspace"),
+                BotCommand("repo", "Выбрать папку (диски D:, E: …)"),
                 BotCommand("sessions", "Continue a previous session"),
                 BotCommand("model", "Choose Claude model"),
                 BotCommand("abort", "Stop the current request"),
@@ -875,6 +888,12 @@ class MessageOrchestrator:
         rows = [
             [
                 InlineKeyboardButton(
+                    f"{mark('live_feed')} Ход работы как в терминале",
+                    callback_data="settings:live_feed",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     f"{mark('compact_output')} Компактный вывод",
                     callback_data="settings:compact_output",
                 )
@@ -915,7 +934,7 @@ class MessageOrchestrator:
         s = runtime.settings()
         if value == "reset_always":
             s.set("always_allowed_tools", [])
-        elif value in ("compact_output", "footer", "queue"):
+        elif value in ("live_feed", "compact_output", "footer", "queue"):
             s.toggle(value)
         text, markup = self._settings_menu()
         try:
@@ -1033,7 +1052,10 @@ class MessageOrchestrator:
         await chat.send_action("typing")
 
         verbose_level = self._get_verbose_level(context)
-        compact = bool(runtime.settings().get("compact_output")) and verbose_level > 0
+        live = bool(runtime.settings().get("live_feed")) and verbose_level > 0
+        compact = (
+            bool(runtime.settings().get("compact_output")) or live
+        ) and verbose_level > 0
         progress_msg = await update.message.reply_text(
             "\U0001f4ad Думаю…" if compact else "Working..."
         )
@@ -1063,6 +1085,21 @@ class MessageOrchestrator:
             on_stream = self._make_stream_callback(
                 verbose_level, progress_msg, tool_log, start_time
             )
+
+        # Terminal-like feed: reasoning, tool calls, diffs as separate messages
+        feed: Optional[LiveFeed] = None
+        if live and on_stream is not None:
+            feed = LiveFeed(update.message)
+            formatter_live = LiveFormatter(redact=_redact_secrets)
+            status_stream = on_stream
+
+            async def on_stream(update_obj: StreamUpdate) -> None:  # type: ignore[misc]
+                try:
+                    for chunk in formatter_live.events(update_obj):
+                        feed.add(chunk)
+                except Exception as feed_err:
+                    logger.warning("Live feed failed", error=str(feed_err))
+                await status_stream(update_obj)
 
         # Independent typing heartbeat — stays alive even with no stream events
         heartbeat = self._start_typing_heartbeat(chat)
@@ -1131,6 +1168,8 @@ class MessageOrchestrator:
             ]
         finally:
             heartbeat.cancel()
+            if feed is not None:
+                await feed.close()
 
         if compact:
             tool_count = sum(1 for e in tool_log if e.get("kind") == "tool")
@@ -1433,101 +1472,244 @@ class MessageOrchestrator:
                 "Claude photo processing failed", error=str(e), user_id=user_id
             )
 
+    # --- Folder browser: any folder on drives D: and beyond ---
+
+    _BROWSE_PAGE = 16
+    _BROWSE_HIDDEN = {"$recycle.bin", "system volume information", "recovery"}
+
+    def _path_allowed(self, path: Path) -> bool:
+        from ..security.roots import is_allowed_path
+
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return False
+        return is_allowed_path(resolved) or self._is_within(
+            resolved, self.settings.approved_directory
+        )
+
+    async def _switch_directory(
+        self, context: ContextTypes.DEFAULT_TYPE, user_id: int, target: Path
+    ) -> str:
+        """Make target the working directory; returns a short status line."""
+        context.user_data["current_directory"] = target
+
+        claude_integration = context.bot_data.get("claude_integration")
+        session_id = None
+        if claude_integration:
+            existing = await claude_integration._find_resumable_session(
+                user_id, target
+            )
+            if existing:
+                session_id = existing.session_id
+        context.user_data["claude_session_id"] = session_id
+
+        git_badge = " (git)" if (target / ".git").is_dir() else ""
+        session_badge = " · session resumed" if session_id else ""
+        return f"<code>{escape_html(str(target))}</code>{git_badge}{session_badge}"
+
+    def _browse_view(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        path: Optional[Path],
+        page: int = 0,
+    ) -> Tuple[str, InlineKeyboardMarkup]:
+        """Build the folder (or drive) list for the browser message."""
+        from ..security.roots import allowed_drives
+
+        rows: List[list] = []  # type: ignore[type-arg]
+        if path is None:
+            drives = allowed_drives()
+            context.user_data["browse"] = {
+                "path": None,
+                "drives": [str(d) for d in drives],
+                "children": [],
+                "page": 0,
+            }
+            buttons = [
+                InlineKeyboardButton(f"\U0001f4bd {d}", callback_data=f"br:dr:{i}")
+                for i, d in enumerate(drives)
+            ]
+            for i in range(0, len(buttons), 3):
+                rows.append(buttons[i : i + 3])
+            return "<b>Диски</b>\nВыберите диск:", InlineKeyboardMarkup(rows)
+
+        try:
+            children = sorted(
+                (
+                    d.name
+                    for d in path.iterdir()
+                    if d.is_dir()
+                    and not d.name.startswith(".")
+                    and d.name.lower() not in self._BROWSE_HIDDEN
+                ),
+                key=str.lower,
+            )
+            error = ""
+        except OSError as e:
+            children, error = [], f"\n⚠️ {escape_html(str(e)[:120])}"
+
+        pages = max(1, -(-len(children) // self._BROWSE_PAGE))
+        page = min(max(page, 0), pages - 1)
+        context.user_data["browse"] = {
+            "path": str(path),
+            "drives": [],
+            "children": children,
+            "page": page,
+        }
+
+        start = page * self._BROWSE_PAGE
+        buttons = []
+        for i in range(start, min(start + self._BROWSE_PAGE, len(children))):
+            name = children[i]
+            icon = "\U0001f4e6" if (path / name / ".git").is_dir() else "\U0001f4c1"
+            label = name if len(name) <= 26 else name[:25] + "…"
+            buttons.append(
+                InlineKeyboardButton(f"{icon} {label}", callback_data=f"br:d:{i}")
+            )
+        for i in range(0, len(buttons), 2):
+            rows.append(buttons[i : i + 2])
+
+        if pages > 1:
+            nav = []
+            if page > 0:
+                nav.append(
+                    InlineKeyboardButton("◀", callback_data=f"br:pg:{page - 1}")
+                )
+            nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="br:noop"))
+            if page < pages - 1:
+                nav.append(
+                    InlineKeyboardButton("▶", callback_data=f"br:pg:{page + 1}")
+                )
+            rows.append(nav)
+        rows.append(
+            [
+                InlineKeyboardButton("⬆️ Вверх", callback_data="br:up"),
+                InlineKeyboardButton("\U0001f4bd Диски", callback_data="br:drives"),
+                InlineKeyboardButton("✅ Выбрать", callback_data="br:sel"),
+            ]
+        )
+        text = (
+            f"<b>Папка</b>\n<code>{escape_html(str(path))}</code>\n"
+            f"Подпапок: {len(children)}{error}"
+        )
+        return text, InlineKeyboardMarkup(rows)
+
+    async def _open_browser(
+        self, message: Any, context: ContextTypes.DEFAULT_TYPE, path: Optional[Path]
+    ) -> None:
+        text, markup = self._browse_view(context, path)
+        await message.reply_text(text, parse_mode="HTML", reply_markup=markup)
+
+    async def _handle_browse_callback(
+        self, query: Any, value: str, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        state = context.user_data.get("browse")
+        if not state:
+            await query.edit_message_text("Меню устарело. Отправьте /repo ещё раз.")
+            return
+
+        action, _, arg = value.partition(":")
+        current = Path(state["path"]) if state.get("path") else None
+        target: Optional[Path] = current
+        page = 0
+
+        if action == "noop":
+            return
+        if action == "drives":
+            target = None
+        elif action == "dr":
+            try:
+                target = Path(state["drives"][int(arg)])
+            except (ValueError, IndexError):
+                return
+        elif action == "d" and current is not None:
+            try:
+                target = current / state["children"][int(arg)]
+            except (ValueError, IndexError):
+                return
+        elif action == "up" and current is not None:
+            target = None if current.parent == current else current.parent
+        elif action == "pg" and current is not None:
+            try:
+                page = int(arg)
+            except ValueError:
+                return
+        elif action == "sel" and current is not None:
+            if not self._path_allowed(current) or not current.is_dir():
+                await query.edit_message_text("Эта папка недоступна.")
+                return
+            status = await self._switch_directory(
+                context, query.from_user.id, current
+            )
+            await query.edit_message_text(
+                f"\U0001f4c2 Рабочая папка: {status}", parse_mode="HTML"
+            )
+            audit_logger = context.bot_data.get("audit_logger")
+            if audit_logger:
+                await audit_logger.log_command(
+                    user_id=query.from_user.id,
+                    command="cd",
+                    args=[str(current)],
+                    success=True,
+                )
+            return
+        else:
+            return
+
+        if target is not None and (
+            not self._path_allowed(target) or not target.is_dir()
+        ):
+            await query.message.reply_text("Папка недоступна.")
+            return
+
+        text, markup = self._browse_view(context, target, page)
+        try:
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        except Exception:
+            pass  # message not modified
+
     async def agentic_repo(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """List repos in workspace or switch to one.
+        """Choose the working folder on any drive from D: upward.
 
-        /repo          — list subdirectories with git indicators
-        /repo <name>   — switch to that directory, resume session if available
+        /repo            — folder browser starting at the current folder
+        /repo <path|name> — switch directly (absolute path, or name under the base)
         """
-        args = update.message.text.split()[1:] if update.message.text else []
+        raw = (update.message.text or "").split(maxsplit=1)
+        arg = raw[1].strip().strip('"') if len(raw) > 1 else ""
         base = self.settings.approved_directory
-        current_dir = context.user_data.get("current_directory", base)
+        current_dir = Path(context.user_data.get("current_directory", base))
 
-        if args:
-            # Switch to named repo
-            target_name = args[0]
-            target_path = base / target_name
-            if not target_path.is_dir():
-                await update.message.reply_text(
-                    f"Directory not found: <code>{escape_html(target_name)}</code>",
-                    parse_mode="HTML",
-                )
-                return
+        if not arg:
+            await self._open_browser(update.message, context, current_dir)
+            return
 
-            context.user_data["current_directory"] = target_path
-
-            # Try to find a resumable session
-            claude_integration = context.bot_data.get("claude_integration")
-            session_id = None
-            if claude_integration:
-                existing = await claude_integration._find_resumable_session(
-                    update.effective_user.id, target_path
-                )
-                if existing:
-                    session_id = existing.session_id
-            context.user_data["claude_session_id"] = session_id
-
-            is_git = (target_path / ".git").is_dir()
-            git_badge = " (git)" if is_git else ""
-            session_badge = " · session resumed" if session_id else ""
-
+        candidate = Path(arg)
+        target = candidate if candidate.is_absolute() else base / candidate
+        if not target.is_dir() or not self._path_allowed(target):
             await update.message.reply_text(
-                f"Switched to <code>{escape_html(target_name)}/</code>"
-                f"{git_badge}{session_badge}",
+                f"Папка недоступна или не найдена: <code>{escape_html(arg)}</code>",
                 parse_mode="HTML",
             )
             return
 
-        # No args — list repos
-        try:
-            entries = sorted(
-                [
-                    d
-                    for d in base.iterdir()
-                    if d.is_dir() and not d.name.startswith(".")
-                ],
-                key=lambda d: d.name,
-            )
-        except OSError as e:
-            await update.message.reply_text(f"Error reading workspace: {e}")
-            return
-
-        if not entries:
-            await update.message.reply_text(
-                f"No repos in <code>{escape_html(str(base))}</code>.\n"
-                'Clone one by telling me, e.g. <i>"clone org/repo"</i>.',
-                parse_mode="HTML",
-            )
-            return
-
-        lines: List[str] = []
-        keyboard_rows: List[list] = []  # type: ignore[type-arg]
-        current_name = current_dir.name if current_dir != base else None
-
-        for d in entries:
-            is_git = (d / ".git").is_dir()
-            icon = "\U0001f4e6" if is_git else "\U0001f4c1"
-            marker = " \u25c0" if d.name == current_name else ""
-            lines.append(f"{icon} <code>{escape_html(d.name)}/</code>{marker}")
-
-        # Build inline keyboard (2 per row)
-        for i in range(0, len(entries), 2):
-            row = []
-            for j in range(2):
-                if i + j < len(entries):
-                    name = entries[i + j].name
-                    row.append(InlineKeyboardButton(name, callback_data=f"cd:{name}"))
-            keyboard_rows.append(row)
-
-        reply_markup = InlineKeyboardMarkup(keyboard_rows)
-
-        await update.message.reply_text(
-            "<b>Repos</b>\n\n" + "\n".join(lines),
-            parse_mode="HTML",
-            reply_markup=reply_markup,
+        status = await self._switch_directory(
+            context, update.effective_user.id, target.resolve()
         )
+        await update.message.reply_text(
+            f"\U0001f4c2 Рабочая папка: {status}", parse_mode="HTML"
+        )
+
+    async def agentic_dir_button(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Bottom-keyboard folder button: open the browser."""
+        current = Path(
+            context.user_data.get("current_directory", self.settings.approved_directory)
+        )
+        await self._open_browser(update.message, context, current)
 
     # Models offered by /model: (button label, value passed to Claude Code)
     _MODEL_CHOICES = [
@@ -1558,6 +1740,7 @@ class MessageOrchestrator:
                 [
                     KeyboardButton(f"{emoji} {label}"),
                     KeyboardButton(f"\U0001f9e0 {self._model_label()}"[:40]),
+                    KeyboardButton("\U0001f4c1 Папка"),
                 ]
             ],
             resize_keyboard=True,
@@ -1718,6 +1901,10 @@ class MessageOrchestrator:
 
         if kind == "settings":
             await self._handle_settings_callback(query, value)
+            return
+
+        if kind == "br":
+            await self._handle_browse_callback(query, value, context)
             return
 
         if kind in ("model", "mode"):

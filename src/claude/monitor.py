@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import structlog
 
 from ..config.settings import Settings
+from ..security.roots import is_allowed_path
 from ..security.validators import SecurityValidator
 
 logger = structlog.get_logger()
@@ -119,7 +120,8 @@ def check_bash_directory_boundary(
             resolved = (working_directory / token).resolve()
 
         try:
-            resolved.relative_to(resolved_approved)
+            if not is_allowed_path(resolved):
+                resolved.relative_to(resolved_approved)
         except ValueError:
             return False, (
                 f"Directory boundary violation: '{base_command}' targets "

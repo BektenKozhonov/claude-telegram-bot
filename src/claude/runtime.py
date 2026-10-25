@@ -39,6 +39,7 @@ DEFAULTS: Dict[str, Any] = {
     "mode": "default",
     "model": "",
     "compact_output": True,
+    "live_feed": True,
     "footer": False,
     "queue": True,
     "always_allowed_tools": [],

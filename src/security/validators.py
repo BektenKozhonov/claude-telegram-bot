@@ -209,6 +209,10 @@ class SecurityValidator:
 
     def _is_within_directory(self, path: Path, directory: Path) -> bool:
         """Check if path is within directory."""
+        from .roots import is_allowed_path
+
+        if is_allowed_path(path):
+            return True
         try:
             path.relative_to(directory)
             return True

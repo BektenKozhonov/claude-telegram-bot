@@ -27,6 +27,8 @@ from claude_agent_sdk import (
     PermissionResultDeny,
     ProcessError,
     ResultMessage,
+    ThinkingBlock,
+    ToolResultBlock,
     ToolUseBlock,
     UserMessage,
 )
@@ -196,6 +198,10 @@ class ClaudeSDKManager:
             chosen_model = user_settings.get("model")
             if chosen_model:
                 options.model = chosen_model
+
+            # Ask for reasoning summaries so the live feed can show them
+            if user_settings.get("live_feed"):
+                options.thinking = {"type": "adaptive", "display": "summarized"}
 
             mode = user_settings.get("mode") or "default"
             requester = runtime.permission_requesters.get(user_id) if user_id else None
@@ -460,10 +466,14 @@ class ClaudeSDKManager:
                 content = getattr(message, "content", [])
                 text_parts = []
                 tool_calls = []
+                thinking_parts = []
 
                 if content and isinstance(content, list):
                     for block in content:
-                        if isinstance(block, ToolUseBlock):
+                        if isinstance(block, ThinkingBlock):
+                            if block.thinking:
+                                thinking_parts.append(block.thinking)
+                        elif isinstance(block, ToolUseBlock):
                             tool_calls.append(
                                 {
                                     "name": getattr(block, "name", "unknown"),
@@ -474,11 +484,16 @@ class ClaudeSDKManager:
                         elif hasattr(block, "text"):
                             text_parts.append(block.text)
 
-                if text_parts or tool_calls:
+                if text_parts or tool_calls or thinking_parts:
                     update = StreamUpdate(
                         type="assistant",
                         content=("\n".join(text_parts) if text_parts else None),
                         tool_calls=tool_calls if tool_calls else None,
+                        metadata=(
+                            {"thinking": "\n".join(thinking_parts)}
+                            if thinking_parts
+                            else None
+                        ),
                     )
                     await stream_callback(update)
                 elif content:
@@ -492,14 +507,39 @@ class ClaudeSDKManager:
             elif isinstance(message, UserMessage):
                 content = getattr(message, "content", "")
                 if content:
+                    results = []
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, ToolResultBlock):
+                                results.append(
+                                    {
+                                        "id": block.tool_use_id,
+                                        "is_error": bool(block.is_error),
+                                        "text": self._result_text(block.content),
+                                    }
+                                )
                     update = StreamUpdate(
                         type="user",
                         content=content,
+                        metadata={"tool_results": results} if results else None,
                     )
                     await stream_callback(update)
 
         except Exception as e:
             logger.warning("Stream callback failed", error=str(e))
+
+    @staticmethod
+    def _result_text(content: Any) -> str:
+        """Flatten a tool result (string or list of blocks) to plain text."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+            return "\n".join(parts)
+        return ""
 
     def _extract_content_from_messages(self, messages: List[Message]) -> str:
         """Extract content from message list."""

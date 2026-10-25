@@ -1050,10 +1050,12 @@ def _update_working_directory_from_claude_response(
                     new_path = Path(new_path).resolve()
 
                 # Validate that the new path is within the approved directory
+                from ...security.roots import is_allowed_path
+
                 if (
                     new_path.is_relative_to(settings.approved_directory)
-                    and new_path.exists()
-                ):
+                    or is_allowed_path(new_path)
+                ) and new_path.exists():
                     context.user_data["current_directory"] = new_path
                     logger.info(
                         "Updated working directory from Claude response",

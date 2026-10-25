@@ -9,6 +9,7 @@ import asyncio
 import html
 import re
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 import structlog
@@ -32,6 +33,19 @@ _ICONS = {
     "Task": "\U0001f916",
     "TodoWrite": "\U0001f4dd",
 }
+
+
+_MAX_FILES = 5
+_MAX_FILE_BYTES = 2 * 1024 * 1024
+_SENSITIVE_RE = re.compile(
+    r"^\.env(\..*)?$|\.(pem|key|pfx|p12|kdbx)$|^id_(rsa|ed25519|ecdsa)|"
+    r"^(credentials|secrets?)(\..*)?$",
+    re.IGNORECASE,
+)
+
+
+def _is_sensitive(name: str) -> bool:
+    return bool(_SENSITIVE_RE.search(name))
 
 
 def _esc(text: str) -> str:
@@ -61,6 +75,9 @@ class LiveFormatter:
         # Last assistant text: commentary if tools follow, else the final answer
         # (which the bot sends itself, so it is not repeated in the feed).
         self._pending_text = ""
+        # Write calls in flight (tool id -> path) and files successfully written
+        self._write_paths: Dict[str, str] = {}
+        self.written: Dict[str, None] = {}
 
     def events(self, upd: Any) -> List[str]:
         out: List[str] = []
@@ -119,11 +136,9 @@ class LiveFormatter:
         if name == "Write" and path:
             content = str(inp.get("content", ""))
             lines = content.count("\n") + 1 if content else 0
-            preview = "\n".join(content.splitlines()[:12])
-            block = (
-                f"<pre>{_esc(_cut(self._redact(preview), 900))}</pre>" if preview else ""
-            )
-            return f"{head} <code>{_esc(str(path))}</code> · {lines} строк\n{block}"
+            if tc.get("id"):
+                self._write_paths[tc["id"]] = str(path)
+            return f"{head} <code>{_esc(str(path))}</code> · {lines} строк"
         if name == "Edit" and path:
             diff = _diff_block(
                 self._redact(str(inp.get("old_string", ""))),
@@ -175,6 +190,10 @@ class LiveFormatter:
     def _result(self, res: Dict[str, Any]) -> str:
         name = self._names.get(res.get("id", ""), "")
         text = (res.get("text") or "").strip()
+        written = self._write_paths.pop(res.get("id", ""), None)
+        if written and not res.get("is_error"):
+            self.written.pop(written, None)  # keep the latest write last
+            self.written[written] = None
         if res.get("is_error"):
             return f"❌ <b>{_esc(name or 'Ошибка')}</b>: <code>{_esc(_cut(self._redact(text), 400))}</code>"
         if name == "Bash" and text:
@@ -242,8 +261,8 @@ class LiveFeed:
                 logger.warning("Live feed send failed", error=str(e))
                 return
 
-    async def close(self) -> None:
-        """Deliver everything still buffered."""
+    async def close(self, files: Optional[List[str]] = None) -> None:
+        """Deliver everything still buffered, then the files Claude wrote."""
         if self._task is not None and not self._task.done():
             try:
                 await self._task
@@ -251,3 +270,29 @@ class LiveFeed:
                 pass
         while self._buffer:
             await self._flush()
+        for path in (files or [])[:_MAX_FILES]:
+            await self._send_file(path)
+
+    async def _send_file(self, raw_path: str) -> None:
+        """Send a written file in place (no copies are created)."""
+        from ..security.roots import is_allowed_path
+
+        path = Path(raw_path)
+        try:
+            if (
+                not path.is_absolute()
+                or not is_allowed_path(path.resolve())
+                or not path.is_file()
+                or path.stat().st_size > _MAX_FILE_BYTES
+                or _is_sensitive(path.name)
+            ):
+                return
+            with path.open("rb") as handle:
+                await self._message.reply_document(
+                    document=handle,
+                    filename=path.name,
+                    caption=str(path)[:200],
+                    disable_notification=True,
+                )
+        except Exception as e:
+            logger.warning("Sending written file failed", error=str(e))

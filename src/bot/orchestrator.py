@@ -894,6 +894,12 @@ class MessageOrchestrator:
             ],
             [
                 InlineKeyboardButton(
+                    f"{mark('send_files')} Присылать созданные файлы",
+                    callback_data="settings:send_files",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     f"{mark('compact_output')} Компактный вывод",
                     callback_data="settings:compact_output",
                 )
@@ -934,7 +940,7 @@ class MessageOrchestrator:
         s = runtime.settings()
         if value == "reset_always":
             s.set("always_allowed_tools", [])
-        elif value in ("live_feed", "compact_output", "footer", "queue"):
+        elif value in ("live_feed", "send_files", "compact_output", "footer", "queue"):
             s.toggle(value)
         text, markup = self._settings_menu()
         try:
@@ -1169,7 +1175,8 @@ class MessageOrchestrator:
         finally:
             heartbeat.cancel()
             if feed is not None:
-                await feed.close()
+                send_files = bool(runtime.settings().get("send_files"))
+                await feed.close(list(formatter_live.written) if send_files else [])
 
         if compact:
             tool_count = sum(1 for e in tool_log if e.get("kind") == "tool")

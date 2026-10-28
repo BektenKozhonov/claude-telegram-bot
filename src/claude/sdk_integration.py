@@ -187,10 +187,17 @@ class ClaudeSDKManager:
                     "autoAllowBashIfSandboxed": True,
                     "excludedCommands": self.config.sandbox_excluded_commands or [],
                 },
-                system_prompt=(
-                    f"All file operations must stay within {working_directory}. "
-                    "Use relative paths."
-                ),
+                # Full Claude Code prompt plus user/project settings, so skills,
+                # CLAUDE.md, memory and MCP servers work as in the terminal.
+                system_prompt={
+                    "type": "preset",
+                    "preset": "claude_code",
+                    "append": (
+                        "You are being driven from Telegram. "
+                        f"Work within {working_directory}."
+                    ),
+                },
+                setting_sources=["user", "project", "local"],
             )
 
             # Model and permission mode chosen in Telegram (data/settings.json)
@@ -214,28 +221,48 @@ class ClaudeSDKManager:
                     always = set(user_settings.always_allowed())
                     allowed = list(self.config.claude_allowed_tools or [])
                     options.allowed_tools = [
-                        t for t in allowed if t in runtime.SAFE_TOOLS or t in always
+                        t
+                        for t in allowed
+                        if (t in runtime.SAFE_TOOLS or t in always)
+                        and t != "AskUserQuestion"
                     ]
 
-                    async def _can_use_tool(
-                        tool_name: str, tool_input: Dict[str, Any], _ctx: Any
-                    ) -> Any:
-                        if tool_name in runtime.settings().always_allowed():
-                            return PermissionResultAllow()
-                        ask = runtime.permission_requesters.get(user_id)  # type: ignore[arg-type]
-                        if ask is None:
-                            return PermissionResultDeny(message="No approver")
-                        decision = await ask(tool_name, tool_input)
-                        if decision == "always":
-                            runtime.settings().add_always_allowed(tool_name)
-                            return PermissionResultAllow()
-                        if decision == "once":
-                            return PermissionResultAllow()
-                        return PermissionResultDeny(
-                            message="Rejected by the user in Telegram"
+                async def _can_use_tool(
+                    tool_name: str, tool_input: Dict[str, Any], _ctx: Any
+                ) -> Any:
+                    # Questions need the user's answers, not just an "allow"
+                    if tool_name == "AskUserQuestion":
+                        asker = runtime.question_askers.get(user_id)  # type: ignore[arg-type]
+                        if asker is None:
+                            return PermissionResultDeny(message="No one to answer")
+                        answers = await asker(list(tool_input.get("questions") or []))
+                        if answers is None:
+                            return PermissionResultDeny(
+                                message="The user did not answer in Telegram"
+                            )
+                        return PermissionResultAllow(
+                            updated_input={**tool_input, "answers": answers}
                         )
+                    if (
+                        mode == "bypassPermissions"
+                        or tool_name in runtime.SAFE_TOOLS
+                        or tool_name in runtime.settings().always_allowed()
+                    ):
+                        return PermissionResultAllow()
+                    ask = runtime.permission_requesters.get(user_id)  # type: ignore[arg-type]
+                    if ask is None:
+                        return PermissionResultDeny(message="No approver")
+                    decision = await ask(tool_name, tool_input)
+                    if decision == "always":
+                        runtime.settings().add_always_allowed(tool_name)
+                        return PermissionResultAllow()
+                    if decision == "once":
+                        return PermissionResultAllow()
+                    return PermissionResultDeny(
+                        message="Rejected by the user in Telegram"
+                    )
 
-                    options.can_use_tool = _can_use_tool
+                options.can_use_tool = _can_use_tool
                 # Time spent waiting for the human must not hit the timeout
                 timeout_seconds = max(timeout_seconds, 3600)
 

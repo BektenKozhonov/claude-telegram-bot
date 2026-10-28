@@ -279,9 +279,10 @@ class ClaudeCodeBot:
         }
 
         error_type = type(error)
-        user_message = error_messages.get(
-            error_type, "❌ An unexpected error occurred. Please try again."
-        )
+        user_message = error_messages.get(error_type)
+        if user_message is None:
+            detail = str(error).strip()[:300] or "без описания"
+            user_message = f"❌ Ошибка {error_type.__name__}: {detail}"
 
         # Try to notify user
         if update and update.effective_message:

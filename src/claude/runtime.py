@@ -21,6 +21,7 @@ MODES: Dict[str, tuple] = {  # type: ignore[type-arg]
     "default": ("\U0001f6e0", "Обычный"),
     "plan": ("\U0001f4cb", "План"),
     "acceptEdits": ("✏️", "Авто-правки"),
+    "bypassPermissions": ("🔓", "Всё разрешено"),
 }
 
 # Tools that never need confirmation (read-only)
@@ -33,6 +34,13 @@ SAFE_TOOLS = {
     "TodoRead",
     "TodoWrite",
     "WebSearch",
+    "Skill",
+    "Task",
+    "Agent",
+    "TaskOutput",
+    "ToolSearch",
+    "ListMcpResourcesTool",
+    "ReadMcpResourceTool",
 }
 
 DEFAULTS: Dict[str, Any] = {
@@ -122,6 +130,10 @@ def settings() -> UserSettings:
 # user_id -> async (tool_name, tool_input) -> "once" | "always" | "reject"
 PermissionRequester = Callable[[str, Dict[str, Any]], Awaitable[str]]
 permission_requesters: Dict[int, PermissionRequester] = {}
+
+# user_id -> async (questions) -> {question text: answer} | None (AskUserQuestion)
+QuestionAsker = Callable[[List[Dict[str, Any]]], Awaitable[Optional[Dict[str, str]]]]
+question_askers: Dict[int, QuestionAsker] = {}
 
 # user_id -> running ClaudeSDKClient (for /abort)
 active_clients: Dict[int, Any] = {}

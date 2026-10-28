@@ -1,7 +1,6 @@
 """Drive-level access boundary.
 
-The bot may work in any folder on drives D: and beyond (the system drive C: and
-its user profile, which holds Claude credentials, stay off limits).
+The bot may work in any folder on any local drive, C: included.
 """
 
 import ctypes
@@ -10,11 +9,11 @@ import string
 from pathlib import Path
 from typing import List
 
-_FIRST_ALLOWED_LETTER = "D"
+_FIRST_ALLOWED_LETTER = "C"
 
 
 def allowed_drives() -> List[Path]:
-    """Existing drive roots from D: upward (D:\\, E:\\, ...)."""
+    """Existing drive roots from C: upward (C:\\, D:\\, ...)."""
     if os.name != "nt":
         return []
     try:
@@ -29,7 +28,7 @@ def allowed_drives() -> List[Path]:
 
 
 def is_allowed_path(path: Path) -> bool:
-    """True if path lies on a drive from D: upward (always False off Windows)."""
+    """True if path lies on a drive from C: upward (always False off Windows)."""
     if os.name != "nt":
         return False
     drive = path.drive[:1].upper()

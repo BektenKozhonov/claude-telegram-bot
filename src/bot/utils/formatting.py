@@ -61,11 +61,7 @@ class ResponseFormatter:
         # Filter out any empty messages produced by formatting/splitting
         messages = [m for m in messages if m.text and m.text.strip()]
 
-        return (
-            messages
-            if messages
-            else [FormattedMessage("<i>(No content to display)</i>")]
-        )
+        return messages
 
     def _should_use_semantic_chunking(self, text: str) -> bool:
         """Determine if semantic chunking is needed."""

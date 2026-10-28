@@ -128,6 +128,10 @@ class MessageOrchestrator:
         self._queues: Dict[int, List[Tuple[Update, Any]]] = {}
         # request id -> (user_id, future resolved with once/always/reject)
         self._pending_perms: Dict[str, Tuple[int, "asyncio.Future[str]"]] = {}
+        # request id -> state of one AskUserQuestion question shown with buttons
+        self._pending_questions: Dict[str, Dict[str, Any]] = {}
+        # user_id -> request id waiting for a typed ("own") answer
+        self._awaiting_text: Dict[int, str] = {}
 
     def _inject_deps(self, handler: Callable) -> Callable:  # type: ignore[type-arg]
         """Wrap handler to inject dependencies into context.bot_data."""
@@ -387,7 +391,7 @@ class MessageOrchestrator:
         app.add_handler(
             CallbackQueryHandler(
                 self._inject_deps(self._agentic_pick_callback),
-                pattern=r"^(sess|model|mode|perm|settings|br):",
+                pattern=r"^(sess|model|mode|perm|ask|settings|br):",
             )
         )
 
@@ -856,6 +860,131 @@ class MessageOrchestrator:
         except Exception:
             pass
 
+    @staticmethod
+    def _question_markup(state: Dict[str, Any]) -> InlineKeyboardMarkup:
+        rid = state["rid"]
+        rows = []
+        for i, opt in enumerate(state["options"]):
+            label = str(opt.get("label", ""))
+            if state["multi"]:
+                label = ("✅ " if i in state["selected"] else "▫️ ") + label
+            rows.append([InlineKeyboardButton(label, callback_data=f"ask:{rid}:{i}")])
+        last = [InlineKeyboardButton("✍️ Свой ответ", callback_data=f"ask:{rid}:own")]
+        if state["multi"]:
+            last.append(
+                InlineKeyboardButton("➡️ Готово", callback_data=f"ask:{rid}:done")
+            )
+        rows.append(last)
+        return InlineKeyboardMarkup(rows)
+
+    async def _ask_questions(
+        self,
+        bot: Any,
+        chat_id: int,
+        user_id: int,
+        questions: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, str]]:
+        """Show AskUserQuestion questions one by one; None if not answered."""
+        answers: Dict[str, str] = {}
+        for q in questions:
+            question = str(q.get("question", ""))
+            options = list(q.get("options") or [])
+            rid = uuid.uuid4().hex[:8]
+            future: "asyncio.Future[Optional[str]]" = (
+                asyncio.get_running_loop().create_future()
+            )
+            lines = [f"❓ <b>{escape_html(str(q.get('header') or 'Вопрос'))}</b>"]
+            lines.append(escape_html(question))
+            for opt in options:
+                desc = str(opt.get("description") or "")
+                item = f"• <b>{escape_html(str(opt.get('label', '')))}</b>"
+                lines.append(item + (f" — {escape_html(desc)}" if desc else ""))
+            if q.get("multiSelect"):
+                lines.append("<i>Можно выбрать несколько, затем «Готово».</i>")
+            state: Dict[str, Any] = {
+                "rid": rid,
+                "user_id": user_id,
+                "future": future,
+                "options": options,
+                "multi": bool(q.get("multiSelect")),
+                "selected": set(),
+                "text": "\n".join(lines),
+            }
+            self._pending_questions[rid] = state
+            message = await bot.send_message(
+                chat_id,
+                state["text"],
+                parse_mode="HTML",
+                reply_markup=self._question_markup(state),
+            )
+            try:
+                answer = await asyncio.wait_for(
+                    future, timeout=self._PERMISSION_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                answer = None
+            finally:
+                self._pending_questions.pop(rid, None)
+                if self._awaiting_text.get(user_id) == rid:
+                    self._awaiting_text.pop(user_id, None)
+            verdict = (
+                f"<b>Ответ:</b> {escape_html(answer)}" if answer else "⌛ Без ответа"
+            )
+            try:
+                await message.edit_text(
+                    state["text"] + "\n\n" + verdict, parse_mode="HTML"
+                )
+            except Exception:
+                pass
+            if not answer:
+                return None
+            answers[question] = answer
+        return answers
+
+    async def _handle_question_callback(self, query: Any, value: str) -> None:
+        rid, _, choice = value.partition(":")
+        state = self._pending_questions.get(rid)
+        if (
+            state is None
+            or state["user_id"] != query.from_user.id
+            or state["future"].done()
+        ):
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+        labels = [str(o.get("label", "")) for o in state["options"]]
+        if choice == "own":
+            self._awaiting_text[state["user_id"]] = rid
+            try:
+                await query.edit_message_text(
+                    state["text"] + "\n\n✍️ <i>Напишите ответ сообщением.</i>",
+                    parse_mode="HTML",
+                    reply_markup=self._question_markup(state),
+                )
+            except Exception:
+                pass
+            return
+        if choice == "done":
+            picked = [labels[i] for i in sorted(state["selected"])]
+            if picked:
+                state["future"].set_result(", ".join(picked))
+            return
+        if not choice.isdigit() or int(choice) >= len(labels):
+            return
+        idx = int(choice)
+        if not state["multi"]:
+            state["future"].set_result(labels[idx])
+            return
+        state["selected"] ^= {idx}
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=self._question_markup(state)
+            )
+        except Exception:
+            pass
+
     async def agentic_abort(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -865,6 +994,10 @@ class MessageOrchestrator:
         for uid, future in list(self._pending_perms.values()):
             if uid == user_id and not future.done():
                 future.set_result("reject")
+        for state in list(self._pending_questions.values()):
+            if state["user_id"] == user_id and not state["future"].done():
+                state["future"].set_result(None)
+        self._awaiting_text.pop(user_id, None)
 
         client = runtime.active_clients.get(user_id)
         if client is None and not dropped:
@@ -953,6 +1086,15 @@ class MessageOrchestrator:
     ) -> None:
         """Entry point for text: run now, or wait in the per-user queue."""
         user_id = update.effective_user.id
+
+        # A typed answer to a question Claude asked with buttons
+        rid = self._awaiting_text.pop(user_id, None)
+        state = self._pending_questions.get(rid) if rid else None
+        if state is not None and not state["future"].done():
+            state["future"].set_result(update.message.text)
+            await update.message.reply_text("✍️ Ответ принят")
+            return
+
         lock = self._user_locks.setdefault(user_id, asyncio.Lock())
 
         if lock.locked():
@@ -991,11 +1133,18 @@ class MessageOrchestrator:
                 bot, chat_id, user_id, tool_name, tool_input
             )
 
+        async def asker(
+            questions: List[Dict[str, Any]],
+        ) -> Optional[Dict[str, str]]:
+            return await self._ask_questions(bot, chat_id, user_id, questions)
+
         runtime.permission_requesters[user_id] = requester
+        runtime.question_askers[user_id] = asker
         try:
             await self._agentic_text_run(update, context)
         finally:
             runtime.permission_requesters.pop(user_id, None)
+            runtime.question_askers.pop(user_id, None)
 
     def _make_compact_callback(
         self,
@@ -1178,18 +1327,10 @@ class MessageOrchestrator:
                 send_files = bool(runtime.settings().get("send_files"))
                 await feed.close(list(formatter_live.written) if send_files else [])
 
-        if compact:
-            tool_count = sum(1 for e in tool_log if e.get("kind") == "tool")
-            elapsed = time.time() - start_time
-            icon = "✅" if success else "⚠️"
-            try:
-                await progress_msg.edit_text(
-                    f"{icon} Готово · вызовов: {tool_count} · {elapsed:.0f} с"
-                )
-            except Exception:
-                pass
-        else:
+        try:
             await progress_msg.delete()
+        except Exception:
+            pass
 
         for i, message in enumerate(formatted_messages):
             if not message.text or not message.text.strip():
@@ -1236,6 +1377,18 @@ class MessageOrchestrator:
                     f"<i>{emoji} {label} · \U0001f9e0 {escape_html(self._model_label())}"
                     f" · ⏱ {time.time() - start_time:.0f} с</i>",
                     parse_mode="HTML",
+                )
+            except Exception:
+                pass
+
+        # Final status goes last so it is clear the run has finished
+        if compact:
+            tool_count = sum(1 for e in tool_log if e.get("kind") == "tool")
+            elapsed = time.time() - start_time
+            status = "✅ Готово" if success else "⚠️ Завершено с ошибкой"
+            try:
+                await update.message.reply_text(
+                    f"{status} · вызовов: {tool_count} · {elapsed:.0f} с"
                 )
             except Exception:
                 pass
@@ -1479,7 +1632,7 @@ class MessageOrchestrator:
                 "Claude photo processing failed", error=str(e), user_id=user_id
             )
 
-    # --- Folder browser: any folder on drives D: and beyond ---
+    # --- Folder browser: any folder on drives C: and beyond ---
 
     _BROWSE_PAGE = 16
     _BROWSE_HIDDEN = {"$recycle.bin", "system volume information", "recovery"}
@@ -1799,6 +1952,7 @@ class MessageOrchestrator:
             "default": "спрашивает перед правками и командами",
             "plan": "только план, ничего не меняет",
             "acceptEdits": "правки файлов без вопросов, команды спрашивает",
+            "bypassPermissions": "все инструменты без вопросов",
         }
         rows = []
         for value, (emoji, label) in runtime.MODES.items():
@@ -1899,11 +2053,18 @@ class MessageOrchestrator:
     ) -> None:
         """Handle sess: and model: button presses."""
         query = update.callback_query
-        await query.answer()
+        try:
+            await query.answer()
+        except Exception:
+            pass  # stale button: Telegram rejects old queries
         kind, _, value = query.data.partition(":")
 
         if kind == "perm":
             await self._handle_permission_callback(query, value)
+            return
+
+        if kind == "ask":
+            await self._handle_question_callback(query, value)
             return
 
         if kind == "settings":
@@ -1962,7 +2123,10 @@ class MessageOrchestrator:
     ) -> None:
         """Handle cd: callbacks — switch directory and resume session if available."""
         query = update.callback_query
-        await query.answer()
+        try:
+            await query.answer()
+        except Exception:
+            pass  # stale button: Telegram rejects old queries
 
         data = query.data
         _, project_name = data.split(":", 1)
